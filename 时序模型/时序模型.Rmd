@@ -1,0 +1,507 @@
+---
+title: "时序模型"
+author: "2253551-李沅衡"
+date: "2024-12-20"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. 数据分析与可视化
+
+### 1.1 数据准备
+```{r}
+# 加载必要的包
+library(ggplot2)      # 数据可视化
+library(dplyr)        # 数据处理
+library(lubridate)    # 日期处理
+library(tidyr)        # 数据整理
+library(tseries)      # 时间序列分析
+library(forecast)     # 预测模型
+library(gridExtra)    # 图表布局
+
+# 读取数据
+data <- read.csv("sales.csv", stringsAsFactors = FALSE)
+
+# 检查缺失值
+sum(is.na(data))  # 查看整个数据集中的缺失值数量
+colSums(is.na(data))  # 查看每一列中缺失值的数量
+data <- na.omit(data)  # 删除包含缺失值的行
+
+str(data)
+summary(data)
+
+# 将datesold转换为日期格式
+data$datesold <- as.Date(data$datesold, format="%Y-%m-%d")
+
+# 数据预处理：处理日期格式和缺失值
+data <- data %>%
+  mutate(datesold = as.Date(datesold)) %>%
+  arrange(datesold) %>%
+  na.omit()
+
+# 显示数据基本信息
+cat("数据概览：\n")
+cat("1. 时间范围：", format(min(data$datesold), "%Y-%m-%d"), "至",
+    format(max(data$datesold), "%Y-%m-%d"), "\n")
+cat("2. 房产类型分布：\n")
+print(table(data$propertyType))
+cat("\n3. 卧室数量分布：\n")
+print(table(data$bedrooms))
+```
+
+### 1.2 时间序列趋势分析
+```{r fig.height=8, fig.width=12}
+# 按月聚合数据
+data_monthly <- data %>%
+  mutate(month = floor_date(datesold, "month")) %>%
+  group_by(month, propertyType) %>%
+  summarize(
+    avg_price = mean(price, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# 1. 房价趋势分析
+p1 <- ggplot(data_monthly, aes(x=month, y=avg_price, color=propertyType)) +
+  geom_line() +
+  geom_smooth(method = "loess", se = FALSE, linetype = "dashed") +
+  labs(title="月度平均房价趋势分析",
+       x="时间",
+       y="平均价格",
+       subtitle = "包含趋势线") +
+  theme_minimal() +
+  theme(legend.position="bottom")
+
+# 2. 房价分布分析
+p2 <- ggplot(data, aes(x=propertyType, y=price, fill=propertyType)) +
+  geom_boxplot() +
+  labs(title="不同类型房产价格分布",
+       x="房产类型",
+       y="价格",
+       subtitle = "显示价格离散程度") +
+  theme_minimal() +
+  theme(legend.position="none")
+
+# 3. 卧室数量与价格关系分析
+p3 <- ggplot(data, aes(x=factor(bedrooms), y=price)) +
+  geom_boxplot(aes(fill=propertyType)) +
+  labs(title="卧室数量与房价关系",
+       x="卧室数量",
+       y="价格",
+       subtitle = "按房产类型分组") +
+  theme_minimal() +
+  theme(legend.position="bottom")
+
+# 4. 季节性分析
+seasonal_data <- data %>%
+  mutate(month_num = month(datesold)) %>%
+  group_by(month_num, propertyType) %>%
+  summarize(
+    avg_price = mean(price, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p4 <- ggplot(seasonal_data, 
+       aes(x=factor(month_num), y=avg_price, color=propertyType, group=propertyType)) +
+  geom_line() +
+  geom_point() +
+  labs(title="房价季节性模式分析",
+       x="月份",
+       y="平均价格",
+       subtitle = "反映月度价格变化规律") +
+  theme_minimal() +
+  theme(legend.position="bottom")
+
+# 组合展示
+grid.arrange(p1, p2, p3, p4, ncol=2)
+
+```
+
+## 2. 时间序列特性检验
+
+### 2.1 平稳性检验
+```{r}
+# 对每种房产类型进行平稳性检验
+property_types <- unique(data_monthly$propertyType)
+
+for(pt in property_types) {
+  cat("\n=== 房产类型:", pt, "===\n")
+  
+  # 提取时间序列数据
+  ts_data <- data_monthly %>% 
+    filter(propertyType == pt) %>% 
+    arrange(month)
+  
+  # 转换为时间序列对象
+  ts_price <- ts(ts_data$avg_price, 
+                 frequency = 12,
+                 start = c(year(min(ts_data$month)), 
+                          month(min(ts_data$month))))
+  
+  # ADF检验
+  adf_test <- adf.test(ts_price)
+  cat("\nADF检验结果:\n")
+  print(adf_test)
+  
+  # 判断是否需要差分
+  if(adf_test$p.value > 0.05) {
+    cat("\n时间序列不平稳，需要差分处理\n")
+    ts_diff <- diff(ts_price)
+    adf_test_diff <- adf.test(ts_diff)
+    cat("\n一阶差分后的ADF检验结果:\n")
+    print(adf_test_diff)
+  } else {
+    cat("\n时间序列平稳，无需差分处理\n")
+  }
+}
+```
+
+### 2.2 自相关性分析
+```{r fig.height=12, fig.width=12}
+
+# 对每种房产类型进行自相关性分析
+for(pt in property_types) {
+  cat("\n=== 房产类型:", pt, "的自相关性分析 ===\n")
+  
+  # 提取时间序列数据
+  ts_data <- data_monthly %>% 
+    filter(propertyType == pt) %>% 
+    arrange(month)
+  
+  ts_price <- ts(ts_data$avg_price, frequency = 12)
+  ts_price_diff <- diff(ts_price)  # 一阶差分
+  
+  # 绘制原始数据和差分后的ACF和PACF图
+  par(mfrow=c(2,2))
+  
+  # 原始数据的ACF和PACF
+  acf_result <- acf(ts_price, main=paste(pt, "- 原始数据ACF图"), lag.max=36)
+  pacf_result <- pacf(ts_price, main=paste(pt, "- 原始数据PACF图"), lag.max=36)
+  
+  # 差分后的ACF和PACF
+  acf_result_diff <- acf(ts_price_diff, main=paste(pt, "- 差分后ACF图"), lag.max=36)
+  pacf_result_diff <- pacf(ts_price_diff, main=paste(pt, "- 差分后PACF图"), lag.max=36)
+  
+  par(mfrow=c(1,1))
+  
+  # 分析原始数据的ACF和PACF
+  significant_acf <- sum(abs(acf_result$acf[-1]) > qnorm(0.975)/sqrt(length(ts_price)))
+  significant_pacf <- sum(abs(pacf_result$acf) > qnorm(0.975)/sqrt(length(ts_price)))
+  
+  # 分析差分后的ACF和PACF
+  significant_acf_diff <- sum(abs(acf_result_diff$acf[-1]) > qnorm(0.975)/sqrt(length(ts_price_diff)))
+  significant_pacf_diff <- sum(abs(pacf_result_diff$acf) > qnorm(0.975)/sqrt(length(ts_price_diff)))
+
+}
+
+```
+### 2.3 纯随机性检验
+```{r}
+# 对每种房产类型进行纯随机性检验
+for(pt in property_types) {
+  cat("\n=== 房产类型:", pt, "的纯随机性检验 ===\n")
+  
+  # 提取时间序列数据
+  ts_data <- data_monthly %>% 
+    filter(propertyType == pt) %>% 
+    arrange(month)
+  
+  ts_price <- ts(ts_data$avg_price, frequency = 12)
+  
+  # Box-Ljung检验
+  lb_test <- Box.test(ts_price, lag = 12, type = "Ljung-Box")
+  cat("\nBox-Ljung检验结果:\n")
+  print(lb_test)
+  
+  # Box-Pierce检验
+  bp_test <- Box.test(ts_price, lag = 12, type = "Box-Pierce")
+  cat("\nBox-Pierce检验结果）:\n")
+  print(bp_test)
+  
+  # 绘制随机性检验图
+  par(mfrow=c(1,2))
+  
+  # 原始数据散点图
+  plot(ts_price, main=paste(pt, "- 原始数据"), ylab="价格", type="o")
+  
+  # 差分后的散点图
+  plot(diff(ts_price), main=paste(pt, "- 一阶差分"), ylab="差分值", type="o")
+  
+  par(mfrow=c(1,1))
+}
+
+```
+
+## 3. ARIMA模型构建与预测
+
+### 3.1 数据集划分
+```{r}
+# 划分训练集和测试集（最后12个月作为测试集）
+last_date <- max(data_monthly$month)
+test_start_date <- last_date - months(11)
+
+data_split <- data_monthly %>%
+  group_by(propertyType) %>%
+  arrange(month) %>%
+  mutate(
+    dataset = if_else(month >= test_start_date, "test", "train")
+  ) %>%
+  ungroup()
+
+# 创建输出目录
+output_dir <- "output"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+}
+```
+
+### 3.2 模型构建与预测
+```{r}
+# 存储所有模型的评估指标
+model_metrics <- data.frame()
+
+# 对每种房产类型建立模型
+for(pt in property_types) {
+  cat("\n=== 建立", pt, "的ARIMA模型 ===\n")
+  
+  # 准备训练和测试数据
+  train_data <- data_split %>% 
+    filter(propertyType == pt, dataset == "train") %>% 
+    arrange(month)
+  
+  test_data <- data_split %>%
+    filter(propertyType == pt, dataset == "test") %>%
+    arrange(month)
+  
+  # 转换为时间序列对象
+  ts_train <- ts(train_data$avg_price, 
+                 frequency = 12,
+                 start = c(year(min(train_data$month)), 
+                          month(min(train_data$month))))
+  
+  # 建立ARIMA模型
+  model <- auto.arima(ts_train, seasonal = TRUE, 
+                     stepwise = FALSE, approximation = FALSE)
+  
+  # 模型诊断
+  cat("\n模型摘要：\n")
+  print(summary(model))
+  checkresiduals(model)
+  
+  # 预测
+  forecasted <- forecast(model, h = 12)
+  
+  # 准备预测结果
+  forecast_df <- data.frame(
+    Month = test_data$month,
+    Actual = test_data$avg_price,
+    Predicted = as.numeric(forecasted$mean),
+    Lower_95 = as.numeric(forecasted$lower[,"95%"]),
+    Upper_95 = as.numeric(forecasted$upper[,"95%"])
+  )
+  
+  # 计算预测误差
+  mae <- mean(abs(forecast_df$Actual - forecast_df$Predicted))
+  rmse <- sqrt(mean((forecast_df$Actual - forecast_df$Predicted)^2))
+  mape <- mean(abs((forecast_df$Actual - forecast_df$Predicted)/
+                     forecast_df$Actual)) * 100
+  
+  # 存储评估指标
+  model_metrics <- rbind(model_metrics, 
+                        data.frame(PropertyType = pt,
+                                 MAE = mae,
+                                 RMSE = rmse,
+                                 MAPE = mape))
+  
+  # 显示预测结果和误差指标
+  cat("\n预测误差指标:\n")
+  cat("MAE:", mae, "\n")
+  cat("RMSE:", rmse, "\n")
+  cat("MAPE:", mape, "%\n")
+  
+  # 保存预测结果
+  write.csv(forecast_df, 
+            file.path(output_dir, paste0("forecast_", pt, ".csv")), 
+            row.names = FALSE)
+  
+  # 绘制预测结果
+  p <- ggplot() +
+    geom_line(data = train_data, 
+              aes(x = month, y = avg_price, color = "历史数据")) +
+    geom_line(data = forecast_df, 
+              aes(x = Month, y = Predicted, color = "预测值")) +
+    geom_line(data = test_data, 
+              aes(x = month, y = avg_price, color = "实际值")) +
+    geom_ribbon(data = forecast_df, 
+                aes(x = Month, ymin = Lower_95, ymax = Upper_95),
+                fill = "grey80", alpha = 0.2) +
+    labs(title = paste(pt, "房价预测结果"),
+         x = "时间",
+         y = "平均价格",
+         color = "数据类型",
+         subtitle = "包含95%置信区间") +
+    theme_minimal() +
+    theme(plot.title = element_text(size = 12, face = "bold"),
+          legend.position = "bottom")
+  
+  print(p)
+  ggsave(file.path(output_dir, paste0("forecast_plot_", pt, ".png")), 
+         p, width = 10, height = 6)
+}
+```
+
+## 4. 模型评估与建议
+
+### 4.1 模型性能评估
+```{r}
+# 显示所有模型的评估指标
+cat("\n=== 各类型房产预测模型性能评估 ===\n")
+print(model_metrics)
+
+# 可视化模型性能
+metrics_long <- model_metrics %>%
+  pivot_longer(cols = c(MAE, RMSE, MAPE),
+               names_to = "Metric",
+               values_to = "Value")
+
+ggplot(metrics_long, aes(x = PropertyType, y = Value, fill = Metric)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~Metric, scales = "free_y") +
+  labs(title = "不同房产类型的预测性能比较",
+       x = "房产类型",
+       y = "误差值",
+       subtitle = "包含MAE、RMSE和MAPE指标") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## 5. 细分市场分析
+
+### 5.1 邮政编码影响分析
+```{r}
+# 分析不同邮政编码区域的房价特征
+postcode_analysis <- data %>%
+  group_by(postcode) %>%
+  summarize(
+    avg_price = mean(price, na.rm = TRUE),
+    median_price = median(price, na.rm = TRUE),
+    price_sd = sd(price, na.rm = TRUE),
+    transaction_count = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_price))
+
+# 显示前10个高价区域
+cat("\n=== 高价值区域分析（前10个邮政编码）===\n")
+print(head(postcode_analysis, 10))
+
+# 绘制邮政编码区域价格分布图
+p1 <- ggplot(head(postcode_analysis, 20), 
+       aes(x = reorder(factor(postcode), -avg_price), y = avg_price)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "前20个高价值邮政编码区域",
+       x = "邮政编码",
+       y = "平均价格") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 分析不同邮政编码区域的房型分布
+postcode_property_dist <- data %>%
+  group_by(postcode, propertyType) %>%
+  summarize(count = n(), .groups = "drop") %>%
+  group_by(postcode) %>%
+  mutate(percentage = count / sum(count) * 100)
+
+# 选择前10个高价值区域的房型分布
+top_10_postcodes <- head(postcode_analysis$postcode, 10)
+p2 <- ggplot(postcode_property_dist %>% filter(postcode %in% top_10_postcodes),
+       aes(x = factor(postcode), y = percentage, fill = propertyType)) +
+  geom_bar(stat = "identity") +
+  labs(title = "高价值区域房产类型分布",
+       x = "邮政编码",
+       y = "占比（%）") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 展示图表
+grid.arrange(p1, p2, ncol = 1)
+
+# 邮政编码区域价格趋势分析
+top_areas_trend <- data %>%
+  filter(postcode %in% top_10_postcodes) %>%
+  mutate(month = floor_date(datesold, "month")) %>%
+  group_by(month, postcode) %>%
+  summarize(avg_price = mean(price, na.rm = TRUE), .groups = "drop")
+
+p3 <- ggplot(top_areas_trend, aes(x = month, y = avg_price, color = factor(postcode))) +
+  geom_line() +
+  labs(title = "高价值区域价格趋势",
+       x = "时间",
+       y = "平均价格",
+       color = "邮政编码") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p3)
+
+```
+
+### 5.2 卧室数量影响分析
+```{r}
+# 分析卧室数量与价格的关系
+bedroom_analysis <- data %>%
+  group_by(bedrooms, propertyType) %>%
+  summarize(
+    avg_price = mean(price, na.rm = TRUE),
+    median_price = median(price, na.rm = TRUE),
+    price_sd = sd(price, na.rm = TRUE),
+    count = n(),
+    .groups = "drop"
+  )
+
+# 绘制卧室数量与价格关系图
+p1 <- ggplot(bedroom_analysis, 
+       aes(x = factor(bedrooms), y = avg_price, fill = propertyType)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "卧室数量与平均价格关系",
+       x = "卧室数量",
+       y = "平均价格") +
+  theme_minimal()
+
+# 分析卧室数量的时间趋势
+bedroom_trend <- data %>%
+  mutate(month = floor_date(datesold, "month")) %>%
+  group_by(month, bedrooms) %>%
+  summarize(avg_price = mean(price, na.rm = TRUE), .groups = "drop")
+
+p2 <- ggplot(bedroom_trend, aes(x = month, y = avg_price, color = factor(bedrooms))) +
+  geom_line() +
+  labs(title = "不同卧室数量房产的价格趋势",
+       x = "时间",
+       y = "平均价格",
+       color = "卧室数量") +
+  theme_minimal()
+
+# 展示图表
+grid.arrange(p1, p2, ncol = 1)
+
+# 分析卧室数量与区域的关系
+bedroom_area <- data %>%
+  group_by(postcode, bedrooms) %>%
+  summarize(
+    avg_price = mean(price, na.rm = TRUE),
+    count = n(),
+    .groups = "drop"
+  ) %>%
+  filter(count >= 10)  # 只考虑样本量足够的组合
+```
+
+
+
